@@ -13,6 +13,9 @@ Flow ownership:
 
 The app intentionally does not use `dataflow-example-app`.
 
+The app references the shared `dataflow/nifi-external` NiFi cluster but does
+not own that cluster or its TLS auth secret.
+
 The NiFi Registry flow ID is manifest-owned:
 
 - `81895831-2aeb-45d8-ae08-16a60b74a4ad`
