@@ -1,0 +1,322 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: nifi-external-cluster-tls-auth
+  namespace: dataflow
+  annotations:
+    argocd.argoproj.io/sync-wave: "60"
+type: Opaque
+stringData:
+  tls.crt: "<path:secret/data/k8s-kafka-nifikop-client-cert-pem#value>"
+  tls.key: "<path:secret/data/k8s-kafka-nifikop-client-key-pem#value>"
+  ca.crt: "<path:secret/data/k8s-kafka-nifi-ca-cert-pem#value>"
+  password: "<path:secret/data/k8s-kafka-nifi-keystore-password#value>"
+---
+apiVersion: nifi.konpyutaika.com/v1
+kind: NifiCluster
+metadata:
+  name: nifi-external
+  namespace: dataflow
+  annotations:
+    argocd.argoproj.io/sync-wave: "61"
+spec:
+  type: external
+  clientType: tls
+  rootProcessGroupId: "root"
+  nifiURI: "nifi.kafka.svc.cluster.local:8443"
+  nodeURITemplate: "nifi-%d.nifi-hs.kafka.svc.cluster.local:8443"
+  nodes:
+    - id: 0
+  secretRef:
+    name: nifi-external-cluster-tls-auth
+    namespace: dataflow
+---
+apiVersion: nifi.konpyutaika.com/v2alpha1
+kind: NifiRegistryClient
+metadata:
+  name: cms-translation-flow-registry
+  namespace: dataflow
+  annotations:
+    argocd.argoproj.io/sync-wave: "62"
+spec:
+  clusterRef:
+    name: nifi-external
+    namespace: dataflow
+  description: "Registry client for CMS translation workflow"
+  type: registry
+  registryClientConfig:
+    uri: "http://nifi-registry.dataflow.svc.cluster.local:18080"
+---
+apiVersion: nifi.konpyutaika.com/v1
+kind: NifiParameterContext
+metadata:
+  name: cms-translation-context
+  namespace: dataflow
+  annotations:
+    argocd.argoproj.io/sync-wave: "63"
+spec:
+  description: "Parameters for CMS content translation flow"
+  clusterRef:
+    name: nifi-external
+    namespace: dataflow
+  secretRefs:
+    - name: cms-translation-kafka-credentials
+      namespace: dataflow
+    - name: cms-translation-flow-secrets
+      namespace: dataflow
+  parameters:
+    - name: cms.kafka.bootstrap.servers
+      value: kafka.kafka.svc.internal.lan:9092
+    - name: cms.kafka.security.protocol
+      value: SASL_PLAINTEXT
+    - name: cms.kafka.sasl.mechanism
+      value: SCRAM-SHA-256
+    - name: cms.translation.request.topic
+      value: batch.cms.content.translation.requests.v1
+    - name: cms.translation.dlq.topic
+      value: batch.cms.content.translation.requests.dlq.v1
+    - name: cms.translation.consumer.group
+      value: nifi-cms-content-translation-v1
+    - name: cms.translation.service.url
+      value: http://cms-translation-service.ollama.svc.cluster.local:8080/translate-content-json
+    - name: cms.translation.upsert.url
+      value: http://cms-content-resolver.directus.svc.cluster.local:8080/content/translations/upsert
+    - name: cms.shell.cache.refresh.url
+      value: https://www-preview.suncoast.systems/api/cache/refresh
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cms-translation-flow-spec
+  namespace: dataflow
+  annotations:
+    argocd.argoproj.io/sync-wave: "64"
+data:
+  flow.json: |
+    {
+      "name": "cms-content-translation",
+      "processors": [
+        {
+          "name": "consume-translation-requests",
+          "type": "org.apache.nifi.kafka.processors.ConsumeKafka",
+          "relationships": ["success"]
+        },
+        {
+          "name": "build-translation-request",
+          "type": "org.apache.nifi.processors.jolt.JoltTransformJSON",
+          "relationships": ["success", "failure"]
+        },
+        {
+          "name": "invoke-openwebui-wrapper",
+          "type": "org.apache.nifi.processors.standard.InvokeHTTP",
+          "url": "#{cms.translation.service.url}",
+          "relationships": ["Response", "Failure", "Retry", "No Retry", "Original"]
+        },
+        {
+          "name": "build-directus-upsert",
+          "type": "org.apache.nifi.processors.jolt.JoltTransformJSON",
+          "relationships": ["success", "failure"]
+        },
+        {
+          "name": "upsert-directus-translation",
+          "type": "org.apache.nifi.processors.standard.InvokeHTTP",
+          "url": "#{cms.translation.upsert.url}",
+          "relationships": ["Response", "Failure", "Retry", "No Retry", "Original"]
+        },
+        {
+          "name": "refresh-shell-cache",
+          "type": "org.apache.nifi.processors.standard.InvokeHTTP",
+          "url": "#{cms.shell.cache.refresh.url}",
+          "relationships": ["Response", "Failure", "Retry", "No Retry", "Original"]
+        },
+        {
+          "name": "publish-translation-dlq",
+          "type": "org.apache.nifi.kafka.processors.PublishKafka",
+          "topic": "#{cms.translation.dlq.topic}",
+          "relationships": ["success", "failure"]
+        }
+      ]
+    }
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: cms-translation-nifi-registry-bootstrap
+  namespace: dataflow
+  annotations:
+    argocd.argoproj.io/sync-wave: "65"
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation,HookSucceeded
+    argocd.argoproj.io/sync-options: Replace=true
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 1800
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cms-translation-nifi-registry-bootstrap
+      annotations:
+        linkerd.io/inject: "disabled"
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: bootstrap-registry-flow
+          image: curlimages/curl:8.12.1
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: NIFI_REGISTRY_API
+              value: "http://nifi-registry.dataflow.svc.cluster.local:18080/nifi-registry-api"
+            - name: NIFI_REGISTRY_BUCKET_ID
+              value: "<path:secret/data/k8s-kafka-nifi-registry-bucket-id#value>"
+            - name: NIFI_REGISTRY_FLOW_ID
+              value: "81895831-2aeb-45d8-ae08-16a60b74a4ad"
+            - name: NIFI_REGISTRY_FLOW_NAME
+              value: "cms-content-translation"
+          command: ["/bin/sh", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+
+              check_http() {
+                local method="$1"
+                local url="$2"
+                local body_file="${3:-}"
+                local status=""
+                if [ -n "${body_file}" ]; then
+                  status="$(curl -sS -o /tmp/resp.json -w "%{http_code}" -X "${method}" \
+                    -H "Content-Type: application/json" "${url}" --data @"${body_file}" || true)"
+                else
+                  status="$(curl -sS -o /tmp/resp.json -w "%{http_code}" -X "${method}" "${url}" || true)"
+                fi
+                echo "${status}"
+              }
+
+              echo "Waiting for NiFi Registry API..."
+              ready="false"
+              for _ in $(seq 1 120); do
+                code="$(check_http GET "${NIFI_REGISTRY_API}/buckets")"
+                if [ "${code}" = "200" ]; then
+                  ready="true"
+                  break
+                fi
+                sleep 2
+              done
+              if [ "${ready}" != "true" ]; then
+                echo "NiFi Registry API is not ready."
+                cat /tmp/resp.json || true
+                exit 1
+              fi
+
+              code="$(check_http GET "${NIFI_REGISTRY_API}/buckets/${NIFI_REGISTRY_BUCKET_ID}")"
+              if [ "${code}" != "200" ]; then
+                echo "Registry bucket id not found: ${NIFI_REGISTRY_BUCKET_ID}"
+                cat /tmp/resp.json || true
+                exit 1
+              fi
+
+              code="$(check_http GET "${NIFI_REGISTRY_API}/buckets/${NIFI_REGISTRY_BUCKET_ID}/flows/${NIFI_REGISTRY_FLOW_ID}")"
+              if [ "${code}" = "404" ]; then
+                cat > /tmp/flow.json <<EOF
+              {
+                "identifier": "${NIFI_REGISTRY_FLOW_ID}",
+                "bucketIdentifier": "${NIFI_REGISTRY_BUCKET_ID}",
+                "name": "${NIFI_REGISTRY_FLOW_NAME}",
+                "description": "CMS content translation flow"
+              }
+              EOF
+                code="$(check_http POST "${NIFI_REGISTRY_API}/buckets/${NIFI_REGISTRY_BUCKET_ID}/flows" /tmp/flow.json)"
+                if [ "${code}" != "200" ] && [ "${code}" != "201" ] && [ "${code}" != "409" ]; then
+                  echo "Failed creating Registry flow: HTTP ${code}"
+                  cat /tmp/resp.json || true
+                  exit 1
+                fi
+              elif [ "${code}" != "200" ]; then
+                echo "Unexpected response checking Registry flow: HTTP ${code}"
+                cat /tmp/resp.json || true
+                exit 1
+              fi
+
+              code="$(check_http GET "${NIFI_REGISTRY_API}/buckets/${NIFI_REGISTRY_BUCKET_ID}/flows/${NIFI_REGISTRY_FLOW_ID}")"
+              if [ "${code}" != "200" ]; then
+                echo "Registry flow was not found after bootstrap: ${NIFI_REGISTRY_FLOW_ID}"
+                cat /tmp/resp.json || true
+                exit 1
+              fi
+
+              code="$(check_http GET "${NIFI_REGISTRY_API}/buckets/${NIFI_REGISTRY_BUCKET_ID}/flows/${NIFI_REGISTRY_FLOW_ID}/versions/1")"
+              if [ "${code}" = "200" ]; then
+                echo "Flow version 1 already exists; nothing to do."
+                exit 0
+              fi
+              if [ "${code}" != "404" ]; then
+                echo "Unexpected response checking flow version 1: HTTP ${code}"
+                cat /tmp/resp.json || true
+                exit 1
+              fi
+
+              cat > /tmp/flow-v1.json <<EOF
+              {
+                "snapshotMetadata": {
+                  "bucketIdentifier": "${NIFI_REGISTRY_BUCKET_ID}",
+                  "flowIdentifier": "${NIFI_REGISTRY_FLOW_ID}",
+                  "version": 1
+                },
+                "flowContents": {
+                  "identifier": "root-group",
+                  "name": "${NIFI_REGISTRY_FLOW_NAME}",
+                  "comments": "Initial CMS translation flow snapshot",
+                  "processGroups": [],
+                  "remoteProcessGroups": [],
+                  "processors": [],
+                  "inputPorts": [],
+                  "outputPorts": [],
+                  "connections": [],
+                  "labels": [],
+                  "funnels": []
+                }
+              }
+              EOF
+
+              code="$(check_http POST "${NIFI_REGISTRY_API}/buckets/${NIFI_REGISTRY_BUCKET_ID}/flows/${NIFI_REGISTRY_FLOW_ID}/versions" /tmp/flow-v1.json)"
+              if [ "${code}" != "200" ] && [ "${code}" != "201" ] && [ "${code}" != "409" ]; then
+                echo "Failed creating flow version 1: HTTP ${code}"
+                cat /tmp/resp.json || true
+                exit 1
+              fi
+
+              code="$(check_http GET "${NIFI_REGISTRY_API}/buckets/${NIFI_REGISTRY_BUCKET_ID}/flows/${NIFI_REGISTRY_FLOW_ID}/versions/1")"
+              if [ "${code}" != "200" ]; then
+                echo "Flow version 1 was not found after bootstrap."
+                cat /tmp/resp.json || true
+                exit 1
+              fi
+---
+apiVersion: nifi.konpyutaika.com/v1
+kind: NifiDataflow
+metadata:
+  name: cms-content-translation
+  namespace: dataflow
+  annotations:
+    argocd.argoproj.io/sync-wave: "66"
+spec:
+  displayName: "cms-content-translation"
+  parentProcessGroupID: "root"
+  bucketId: "<path:secret/data/k8s-kafka-nifi-registry-bucket-id#value>"
+  flowId: "81895831-2aeb-45d8-ae08-16a60b74a4ad"
+  flowVersion: 1
+  flowPosition:
+    posX: 400
+    posY: 0
+  syncMode: once
+  updateStrategy: drain
+  skipInvalidControllerService: true
+  skipInvalidComponent: true
+  clusterRef:
+    name: nifi-external
+    namespace: dataflow
+  registryClientRef:
+    name: cms-translation-flow-registry
+    namespace: dataflow
+  parameterContextRef:
+    name: cms-translation-context
+    namespace: dataflow
