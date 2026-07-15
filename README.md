@@ -22,4 +22,7 @@ The `cms-translation-nifi-registry-bootstrap` Sync hook creates that Registry fl
 Required Vault values before first production sync:
 
 - `secret/data/k8s-kafka-nifi-registry-bucket-id#value`
-- `secret/data/suncoast-shell-cache-refresh-token#value`
+
+Cache refresh bearer tokens are Keycloak access tokens and expire. Do not store
+a static cache refresh access token in Vault; the NiFi flow should mint one from
+Keycloak client credentials at runtime when the refresh step is enabled.

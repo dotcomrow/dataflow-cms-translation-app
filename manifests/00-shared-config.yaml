@@ -26,7 +26,7 @@ metadata:
 type: Opaque
 stringData:
   content_resolver_authorization: ""
-  shell_cache_refresh_authorization: "Bearer <path:secret/data/suncoast-shell-cache-refresh-token#value>"
+  shell_cache_refresh_authorization: ""
 ---
 apiVersion: v1
 kind: Secret
