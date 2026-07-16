@@ -1,0 +1,410 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cms-translation-nifi-runtime-bootstrap
+  namespace: dataflow
+  annotations:
+    argocd.argoproj.io/sync-wave: "64"
+data:
+  bootstrap_flow.py: |
+    import json
+    import os
+    import re
+    import ssl
+    import time
+    import urllib.error
+    import urllib.request
+    import uuid
+
+    NIFI_API = os.environ.get("NIFI_API", "https://nifi-0.nifi-hs.kafka.svc.cluster.local:8443/nifi-api").rstrip("/")
+    FLOW_NAME = os.environ.get("NIFI_FLOW_NAME", "cms-content-translation")
+    CERT_DIR = os.environ.get("NIFI_TLS_DIR", "/nifi-tls")
+    CLIENT_ID = str(uuid.uuid4())
+
+    CONTEXT = ssl.create_default_context(cafile=os.path.join(CERT_DIR, "ca.crt"))
+    CONTEXT.load_cert_chain(
+      certfile=os.path.join(CERT_DIR, "tls.crt"),
+      keyfile=os.path.join(CERT_DIR, "tls.key"),
+    )
+
+    def api(method, path, payload=None, timeout=60):
+      data = None
+      headers = {"Accept": "application/json"}
+      if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+      request = urllib.request.Request(f"{NIFI_API}{path}", data=data, headers=headers, method=method)
+      try:
+        with urllib.request.urlopen(request, context=CONTEXT, timeout=timeout) as response:
+          body = response.read().decode("utf-8")
+          return json.loads(body) if body else {}
+      except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"{method} {path} failed with HTTP {exc.code}: {body}") from exc
+
+    def revision(entity):
+      return {
+        "clientId": CLIENT_ID,
+        "version": entity["revision"]["version"],
+      }
+
+    def norm(value):
+      return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+    def descriptor_key(descriptors, candidates):
+      wanted = {norm(candidate) for candidate in candidates}
+      for key, descriptor in descriptors.items():
+        names = [key, descriptor.get("name"), descriptor.get("displayName")]
+        if any(norm(name) in wanted for name in names):
+          return key
+      available = ", ".join(sorted(descriptors.keys()))
+      raise RuntimeError(f"Could not find descriptor {candidates}; available: {available}")
+
+    def wait_for_cluster():
+      last_error = None
+      for _ in range(120):
+        try:
+          cluster = api("GET", "/controller/cluster", timeout=20).get("cluster", {})
+          nodes = cluster.get("nodes", [])
+          if nodes and all(node.get("status") == "CONNECTED" for node in nodes):
+            return
+        except Exception as exc:
+          last_error = exc
+        time.sleep(5)
+      raise RuntimeError(f"NiFi cluster was not ready: {last_error}")
+
+    def find_process_group():
+      for _ in range(180):
+        root = api("GET", "/flow/process-groups/root", timeout=30).get("processGroupFlow", {})
+        for process_group in root.get("flow", {}).get("processGroups", []):
+          component = process_group.get("component", {})
+          if component.get("name") == FLOW_NAME:
+            return component["id"]
+        time.sleep(5)
+      raise RuntimeError(f"Process group {FLOW_NAME} was not found under root.")
+
+    def list_processors(process_group_id):
+      return api("GET", f"/process-groups/{process_group_id}/processors").get("processors", [])
+
+    def list_connections(process_group_id):
+      return api("GET", f"/process-groups/{process_group_id}/connections").get("connections", [])
+
+    def list_controller_services(process_group_id):
+      return api("GET", f"/flow/process-groups/{process_group_id}/controller-services").get("controllerServices", [])
+
+    def find_by_name(entities, name):
+      for entity in entities:
+        if entity.get("component", {}).get("name") == name:
+          return entity
+      return None
+
+    def ensure_controller_service(process_group_id):
+      existing = find_by_name(list_controller_services(process_group_id), "cms-translation-kafka-connection")
+      if existing:
+        return existing
+      return api(
+        "POST",
+        f"/process-groups/{process_group_id}/controller-services",
+        {
+          "revision": {"clientId": CLIENT_ID, "version": 0},
+          "component": {
+            "name": "cms-translation-kafka-connection",
+            "type": "org.apache.nifi.kafka.service.Kafka3ConnectionService",
+            "bundle": {
+              "group": "org.apache.nifi",
+              "artifact": "nifi-kafka-3-service-nar",
+              "version": "2.7.1",
+            },
+          },
+        },
+      )
+
+    def ensure_processor(process_group_id, name, processor_type, artifact, x, y):
+      existing = find_by_name(list_processors(process_group_id), name)
+      if existing:
+        return existing
+      return api(
+        "POST",
+        f"/process-groups/{process_group_id}/processors",
+        {
+          "revision": {"clientId": CLIENT_ID, "version": 0},
+          "component": {
+            "name": name,
+            "type": processor_type,
+            "bundle": {
+              "group": "org.apache.nifi",
+              "artifact": artifact,
+              "version": "2.7.1",
+            },
+            "position": {"x": x, "y": y},
+          },
+        },
+      )
+
+    def configure_controller_service(entity, property_specs):
+      entity = api("GET", f"/controller-services/{entity['id']}")
+      component = entity["component"]
+      descriptors = component.get("descriptors", {})
+      properties = dict(component.get("properties") or {})
+      for candidates, value in property_specs:
+        properties[descriptor_key(descriptors, candidates)] = value
+      return api(
+        "PUT",
+        f"/controller-services/{entity['id']}",
+        {
+          "revision": revision(entity),
+          "component": {
+            "id": entity["id"],
+            "properties": properties,
+          },
+        },
+      )
+
+    def configure_processor(entity, property_specs, auto_terminated=None):
+      entity = api("GET", f"/processors/{entity['id']}")
+      config = entity["component"].get("config", {})
+      descriptors = config.get("descriptors", {})
+      properties = dict(config.get("properties") or {})
+      for candidates, value in property_specs:
+        properties[descriptor_key(descriptors, candidates)] = value
+      new_config = {"properties": properties}
+      if auto_terminated is not None:
+        new_config["autoTerminatedRelationships"] = auto_terminated
+      return api(
+        "PUT",
+        f"/processors/{entity['id']}",
+        {
+          "revision": revision(entity),
+          "component": {
+            "id": entity["id"],
+            "config": new_config,
+          },
+        },
+      )
+
+    def set_processor_state(entity, state):
+      entity = api("GET", f"/processors/{entity['id']}")
+      if entity["component"].get("state") == state:
+        return entity
+      api(
+        "PUT",
+        f"/processors/{entity['id']}/run-status",
+        {
+          "revision": revision(entity),
+          "state": state,
+          "disconnectedNodeAcknowledged": False,
+        },
+      )
+      for _ in range(60):
+        current = api("GET", f"/processors/{entity['id']}")
+        if current["component"].get("state") == state:
+          return current
+        time.sleep(1)
+      raise RuntimeError(f"Processor {entity['component']['name']} did not reach {state}.")
+
+    def set_controller_service_state(entity, state):
+      entity = api("GET", f"/controller-services/{entity['id']}")
+      if entity["component"].get("state") == state:
+        return entity
+      api(
+        "PUT",
+        f"/controller-services/{entity['id']}/run-status",
+        {
+          "revision": revision(entity),
+          "state": state,
+          "disconnectedNodeAcknowledged": False,
+        },
+      )
+      for _ in range(60):
+        current = api("GET", f"/controller-services/{entity['id']}")
+        if current["component"].get("state") == state:
+          return current
+        time.sleep(1)
+      raise RuntimeError(f"Controller service {entity['component']['name']} did not reach {state}.")
+
+    def ensure_connection(process_group_id, name, source_id, destination_id, relationships):
+      for connection in list_connections(process_group_id):
+        component = connection.get("component", {})
+        if component.get("name") == name:
+          return connection
+      return api(
+        "POST",
+        f"/process-groups/{process_group_id}/connections",
+        {
+          "revision": {"clientId": CLIENT_ID, "version": 0},
+          "component": {
+            "name": name,
+            "source": {
+              "id": source_id,
+              "groupId": process_group_id,
+              "type": "PROCESSOR",
+            },
+            "destination": {
+              "id": destination_id,
+              "groupId": process_group_id,
+              "type": "PROCESSOR",
+            },
+            "selectedRelationships": relationships,
+            "flowFileExpiration": "0 sec",
+            "backPressureObjectThreshold": 10000,
+            "backPressureDataSizeThreshold": "1 GB",
+          },
+        },
+      )
+
+    def main():
+      wait_for_cluster()
+      process_group_id = find_process_group()
+
+      kafka_service = ensure_controller_service(process_group_id)
+      consume = ensure_processor(
+        process_group_id,
+        "consume-translation-requests",
+        "org.apache.nifi.kafka.processors.ConsumeKafka",
+        "nifi-kafka-nar",
+        0,
+        0,
+      )
+      translate = ensure_processor(
+        process_group_id,
+        "invoke-openwebui-wrapper",
+        "org.apache.nifi.processors.standard.InvokeHTTP",
+        "nifi-standard-nar",
+        420,
+        0,
+      )
+      upsert = ensure_processor(
+        process_group_id,
+        "upsert-directus-translation",
+        "org.apache.nifi.processors.standard.InvokeHTTP",
+        "nifi-standard-nar",
+        840,
+        0,
+      )
+      dlq = ensure_processor(
+        process_group_id,
+        "publish-translation-dlq",
+        "org.apache.nifi.kafka.processors.PublishKafka",
+        "nifi-kafka-nar",
+        420,
+        280,
+      )
+
+      for processor in (consume, translate, upsert, dlq):
+        set_processor_state(processor, "STOPPED")
+      set_controller_service_state(kafka_service, "DISABLED")
+
+      kafka_service = configure_controller_service(
+        kafka_service,
+        [
+          (["bootstrap.servers", "Bootstrap Servers"], "#{cms.kafka.bootstrap.servers}"),
+          (["security.protocol", "Security Protocol"], "#{cms.kafka.security.protocol}"),
+          (["sasl.mechanism", "SASL Mechanism"], "#{cms.kafka.sasl.mechanism}"),
+          (["sasl.username", "SASL Username"], "#{nifi_username}"),
+          (["sasl.password", "SASL Password"], "#{nifi_password}"),
+        ],
+      )
+      kafka_service = set_controller_service_state(kafka_service, "ENABLED")
+
+      consume = configure_processor(
+        consume,
+        [
+          (["Kafka Connection Service"], kafka_service["id"]),
+          (["Group ID"], "#{cms.translation.consumer.group}"),
+          (["Topics"], "#{cms.translation.request.topic}"),
+          (["auto.offset.reset", "Auto Offset Reset"], "earliest"),
+        ],
+      )
+      translate = configure_processor(
+        translate,
+        [
+          (["HTTP Method"], "POST"),
+          (["HTTP URL", "Remote URL"], "#{cms.translation.service.url}"),
+          (["Request Body Enabled", "Send Message Body"], "true"),
+          (["Request Content-Type", "Content-Type"], "application/json"),
+          (["Response Generation Required", "Always Output Response"], "true"),
+          (["Socket Read Timeout"], "180 sec"),
+        ],
+        ["Original"],
+      )
+      upsert = configure_processor(
+        upsert,
+        [
+          (["HTTP Method"], "POST"),
+          (["HTTP URL", "Remote URL"], "#{cms.translation.upsert.url}"),
+          (["Request Body Enabled", "Send Message Body"], "true"),
+          (["Request Content-Type", "Content-Type"], "application/json"),
+          (["Response Generation Required", "Always Output Response"], "true"),
+          (["Socket Read Timeout"], "60 sec"),
+        ],
+        ["Original", "Response"],
+      )
+      dlq = configure_processor(
+        dlq,
+        [
+          (["Kafka Connection Service"], kafka_service["id"]),
+          (["Topic Name", "Topic"], "#{cms.translation.dlq.topic}"),
+        ],
+        ["success", "failure"],
+      )
+
+      ensure_connection(process_group_id, "consume-to-translate", consume["id"], translate["id"], ["success"])
+      ensure_connection(process_group_id, "translate-response-to-upsert", translate["id"], upsert["id"], ["Response"])
+      ensure_connection(process_group_id, "translate-failures-to-dlq", translate["id"], dlq["id"], ["Failure", "No Retry", "Retry"])
+      ensure_connection(process_group_id, "upsert-failures-to-dlq", upsert["id"], dlq["id"], ["Failure", "No Retry", "Retry"])
+
+      for processor in (dlq, upsert, translate, consume):
+        set_processor_state(processor, "RUNNING")
+      print(f"CMS translation NiFi flow is configured and running in process group {process_group_id}.")
+
+    if __name__ == "__main__":
+      main()
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: cms-translation-nifi-runtime-bootstrap
+  namespace: dataflow
+  annotations:
+    argocd.argoproj.io/sync-wave: "67"
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation,HookSucceeded
+    argocd.argoproj.io/sync-options: Replace=true
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 1800
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cms-translation-nifi-runtime-bootstrap
+      annotations:
+        linkerd.io/inject: "disabled"
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: bootstrap-runtime-flow
+          image: python:3.11-slim
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: NIFI_API
+              value: "https://nifi-0.nifi-hs.kafka.svc.cluster.local:8443/nifi-api"
+            - name: NIFI_FLOW_NAME
+              value: "cms-content-translation"
+            - name: NIFI_TLS_DIR
+              value: "/nifi-tls"
+          command: ["python", "/bootstrap/bootstrap_flow.py"]
+          volumeMounts:
+            - name: bootstrap-script
+              mountPath: /bootstrap
+              readOnly: true
+            - name: nifi-tls
+              mountPath: /nifi-tls
+              readOnly: true
+      volumes:
+        - name: bootstrap-script
+          configMap:
+            name: cms-translation-nifi-runtime-bootstrap
+            defaultMode: 0555
+        - name: nifi-tls
+          secret:
+            secretName: nifi-external-cluster-tls-auth
