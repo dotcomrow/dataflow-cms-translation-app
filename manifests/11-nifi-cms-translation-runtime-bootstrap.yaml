@@ -86,14 +86,34 @@ data:
       raise RuntimeError(f"NiFi cluster was not ready: {last_error}")
 
     def find_process_group():
+      root = api("GET", "/flow/process-groups/root", timeout=30).get("processGroupFlow", {})
+      for process_group in root.get("flow", {}).get("processGroups", []):
+        component = process_group.get("component", {})
+        if component.get("name") == FLOW_NAME:
+          return component["id"]
+      return ""
+
+    def ensure_process_group():
       for _ in range(180):
-        root = api("GET", "/flow/process-groups/root", timeout=30).get("processGroupFlow", {})
-        for process_group in root.get("flow", {}).get("processGroups", []):
-          component = process_group.get("component", {})
-          if component.get("name") == FLOW_NAME:
-            return component["id"]
+        process_group_id = find_process_group()
+        if process_group_id:
+          return process_group_id
+        created = api(
+          "POST",
+          "/process-groups/root/process-groups",
+          {
+            "revision": {"clientId": CLIENT_ID, "version": 0},
+            "component": {
+              "name": FLOW_NAME,
+              "position": {"x": 400, "y": 0},
+            },
+          },
+        )
+        component = created.get("component", {})
+        if component.get("id"):
+          return component["id"]
         time.sleep(5)
-      raise RuntimeError(f"Process group {FLOW_NAME} was not found under root.")
+      raise RuntimeError(f"Process group {FLOW_NAME} could not be created under root.")
 
     def list_processors(process_group_id):
       return api("GET", f"/process-groups/{process_group_id}/processors").get("processors", [])
@@ -296,7 +316,7 @@ data:
 
     def main():
       wait_for_cluster()
-      process_group_id = find_process_group()
+      process_group_id = ensure_process_group()
 
       kafka_service = ensure_controller_service(process_group_id)
       consume = ensure_processor(

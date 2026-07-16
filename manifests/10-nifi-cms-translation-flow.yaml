@@ -314,7 +314,7 @@ spec:
   flowPosition:
     posX: 400
     posY: 0
-  syncMode: once
+  syncMode: never
   updateStrategy: drain
   skipInvalidControllerService: true
   skipInvalidComponent: true
