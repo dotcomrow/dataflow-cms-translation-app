@@ -19,6 +19,7 @@ data:
     NIFI_API = os.environ.get("NIFI_API", "https://nifi-0.nifi-hs.kafka.svc.cluster.local:8443/nifi-api").rstrip("/")
     FLOW_NAME = os.environ.get("NIFI_FLOW_NAME", "cms-content-translation")
     CERT_DIR = os.environ.get("NIFI_TLS_DIR", "/nifi-tls")
+    KAFKA_CREDENTIALS_DIR = os.environ.get("KAFKA_CREDENTIALS_DIR", "/kafka-credentials")
     CLIENT_ID = str(uuid.uuid4())
 
     CONTEXT = ssl.create_default_context(cafile=os.path.join(CERT_DIR, "ca.crt"))
@@ -47,6 +48,10 @@ data:
         "clientId": CLIENT_ID,
         "version": entity["revision"]["version"],
       }
+
+    def read_secret_file(name):
+      with open(os.path.join(KAFKA_CREDENTIALS_DIR, name), "r", encoding="utf-8") as secret_file:
+        return secret_file.read().strip()
 
     def norm(value):
       return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
@@ -300,7 +305,7 @@ data:
           (["bootstrap.servers", "Bootstrap Servers"], "#{cms.kafka.bootstrap.servers}"),
           (["security.protocol", "Security Protocol"], "#{cms.kafka.security.protocol}"),
           (["sasl.mechanism", "SASL Mechanism"], "#{cms.kafka.sasl.mechanism}"),
-          (["sasl.username", "SASL Username"], "#{nifi_username}"),
+          (["sasl.username", "SASL Username"], read_secret_file("nifi_username")),
           (["sasl.password", "SASL Password"], "#{nifi_password}"),
         ],
       )
@@ -392,6 +397,8 @@ spec:
               value: "cms-content-translation"
             - name: NIFI_TLS_DIR
               value: "/nifi-tls"
+            - name: KAFKA_CREDENTIALS_DIR
+              value: "/kafka-credentials"
           command: ["python", "/bootstrap/bootstrap_flow.py"]
           volumeMounts:
             - name: bootstrap-script
@@ -399,6 +406,9 @@ spec:
               readOnly: true
             - name: nifi-tls
               mountPath: /nifi-tls
+              readOnly: true
+            - name: kafka-credentials
+              mountPath: /kafka-credentials
               readOnly: true
       volumes:
         - name: bootstrap-script
@@ -408,3 +418,6 @@ spec:
         - name: nifi-tls
           secret:
             secretName: nifi-external-cluster-tls-auth
+        - name: kafka-credentials
+          secret:
+            secretName: cms-translation-kafka-credentials
