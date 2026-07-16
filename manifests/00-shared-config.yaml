@@ -14,7 +14,10 @@ data:
   consumer_group: "nifi-cms-content-translation-v1"
   translation_service_url: "http://cms-translation-service.ollama.svc.cluster.local:8080/translate-content-json"
   translation_upsert_url: "http://cms-content-resolver.directus.svc.cluster.local:8080/content/translations/upsert"
-  shell_cache_refresh_url: "https://www-preview.suncoast.systems/api/cache/refresh"
+  shell_cache_refresh_url: "https://www-preview.suncoast.systems/api/cache/refresh?mode=purge-and-refresh"
+  shell_cache_refresh_external_prod_url: "https://www.suncoast.systems/api/cache/refresh?mode=purge-and-refresh"
+  shell_cache_refresh_external_preview_url: "https://www-preview.suncoast.systems/api/cache/refresh?mode=purge-and-refresh"
+  shell_cache_refresh_token_url: "https://auth-origin.suncoast.systems/realms/external/protocol/openid-connect/token"
 ---
 apiVersion: v1
 kind: Secret
@@ -41,3 +44,15 @@ stringData:
   admin_password: "<path:secret/data/kafka-admin-password#value>"
   nifi_username: "<path:secret/data/kafka-nifi-username#value>"
   nifi_password: "<path:secret/data/kafka-nifi-password#value>"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cms-translation-cache-refresh-credentials
+  namespace: dataflow
+  annotations:
+    argocd.argoproj.io/sync-wave: "50"
+type: Opaque
+stringData:
+  client_id: "<path:secret/data/keycloak-client-id-cms-site-external#value>"
+  client_secret: "<path:secret/data/keycloak-client-secret-cms-site-external#value>"

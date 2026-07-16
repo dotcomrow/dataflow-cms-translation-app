@@ -31,6 +31,8 @@ spec:
       namespace: dataflow
     - name: cms-translation-flow-secrets
       namespace: dataflow
+    - name: cms-translation-cache-refresh-credentials
+      namespace: dataflow
   parameters:
     - name: cms.kafka.bootstrap.servers
       value: kafka.kafka.svc.internal.lan:9092
@@ -49,7 +51,13 @@ spec:
     - name: cms.translation.upsert.url
       value: http://cms-content-resolver.directus.svc.cluster.local:8080/content/translations/upsert
     - name: cms.shell.cache.refresh.url
-      value: https://www-preview.suncoast.systems/api/cache/refresh
+      value: https://www-preview.suncoast.systems/api/cache/refresh?mode=purge-and-refresh
+    - name: cms.shell.cache.refresh.external.prod.url
+      value: https://www.suncoast.systems/api/cache/refresh?mode=purge-and-refresh
+    - name: cms.shell.cache.refresh.external.preview.url
+      value: https://www-preview.suncoast.systems/api/cache/refresh?mode=purge-and-refresh
+    - name: cms.shell.cache.refresh.token.url
+      value: https://auth-origin.suncoast.systems/realms/external/protocol/openid-connect/token
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -69,6 +77,11 @@ data:
           "relationships": ["success"]
         },
         {
+          "name": "extract-translation-request-metadata",
+          "type": "org.apache.nifi.processors.standard.EvaluateJsonPath",
+          "relationships": ["matched", "unmatched", "failure"]
+        },
+        {
           "name": "invoke-openwebui-wrapper",
           "type": "org.apache.nifi.processors.standard.InvokeHTTP",
           "url": "#{cms.translation.service.url}",
@@ -78,6 +91,49 @@ data:
           "name": "upsert-directus-translation",
           "type": "org.apache.nifi.processors.standard.InvokeHTTP",
           "url": "#{cms.translation.upsert.url}",
+          "relationships": ["Response", "Failure", "Retry", "No Retry", "Original"]
+        },
+        {
+          "name": "build-cache-refresh-token-request",
+          "type": "org.apache.nifi.processors.standard.ReplaceText",
+          "relationships": ["success", "failure"]
+        },
+        {
+          "name": "request-cache-refresh-token",
+          "type": "org.apache.nifi.processors.standard.InvokeHTTP",
+          "url": "#{cms.shell.cache.refresh.token.url}",
+          "relationships": ["Response", "Failure", "Retry", "No Retry", "Original"]
+        },
+        {
+          "name": "extract-cache-refresh-token",
+          "type": "org.apache.nifi.processors.standard.EvaluateJsonPath",
+          "relationships": ["matched", "unmatched", "failure"]
+        },
+        {
+          "name": "set-cache-refresh-authorization",
+          "type": "org.apache.nifi.processors.attributes.UpdateAttribute",
+          "relationships": ["success"]
+        },
+        {
+          "name": "build-cache-refresh-request",
+          "type": "org.apache.nifi.processors.standard.ReplaceText",
+          "relationships": ["success", "failure"]
+        },
+        {
+          "name": "route-cache-refresh-target",
+          "type": "org.apache.nifi.processors.standard.RouteOnAttribute",
+          "relationships": ["prod", "unmatched"]
+        },
+        {
+          "name": "refresh-shell-cache-prod",
+          "type": "org.apache.nifi.processors.standard.InvokeHTTP",
+          "url": "#{cms.shell.cache.refresh.external.prod.url}",
+          "relationships": ["Response", "Failure", "Retry", "No Retry", "Original"]
+        },
+        {
+          "name": "refresh-shell-cache-preview",
+          "type": "org.apache.nifi.processors.standard.InvokeHTTP",
+          "url": "#{cms.shell.cache.refresh.external.preview.url}",
           "relationships": ["Response", "Failure", "Retry", "No Retry", "Original"]
         },
         {
