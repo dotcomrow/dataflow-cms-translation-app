@@ -491,7 +491,7 @@ data:
           (["Request Body Enabled", "Send Message Body"], "true"),
           (["Request Content-Type", "Content-Type"], "application/json"),
           (["Response Generation Required", "Always Output Response"], "true"),
-          (["Socket Read Timeout"], "180 sec"),
+          (["Socket Read Timeout"], "600 sec"),
         ],
         ["Original"],
       )
