@@ -11,8 +11,6 @@ Flow ownership:
 5. Refresh the shell cache for the requested `page_slug` and `language`.
 6. Route failures to `batch.cms.content.translation.requests.dlq.v1`.
 
-The app intentionally does not use `dataflow-example-app`.
-
 The app references the shared `dataflow/nifi-external` NiFi cluster but does
 not own that cluster or its TLS auth secret.
 
