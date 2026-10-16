@@ -344,7 +344,7 @@ spec:
   flowVersion: 2
   flowPosition:
     posX: 400
-    posY: 0
+    posY: 1
   syncMode: always
   updateStrategy: drain
   skipInvalidControllerService: true
