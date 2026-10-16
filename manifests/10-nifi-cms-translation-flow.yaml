@@ -338,7 +338,6 @@ metadata:
     argocd.argoproj.io/sync-wave: "66"
 spec:
   displayName: "cms-content-translation"
-  parentProcessGroupID: "root"
   bucketId: "<path:secret/data/k8s-kafka-nifi-registry-bucket-id#value>"
   flowId: "81895831-2aeb-45d8-ae08-16a60b74a4ad"
   flowVersion: 2
