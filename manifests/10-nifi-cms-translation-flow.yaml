@@ -251,17 +251,14 @@ spec:
               fi
 
               code="$(check_http GET "${NIFI_REGISTRY_API}/buckets/${NIFI_REGISTRY_BUCKET_ID}/flows/${NIFI_REGISTRY_FLOW_ID}/versions/1")"
-              if [ "${code}" = "200" ]; then
-                echo "Flow version 1 already exists; nothing to do."
-                exit 0
-              fi
-              if [ "${code}" != "404" ]; then
+              if [ "${code}" != "200" ] && [ "${code}" != "404" ]; then
                 echo "Unexpected response checking flow version 1: HTTP ${code}"
                 cat /tmp/resp.json || true
                 exit 1
               fi
 
-              cat > /tmp/flow-v1.json <<EOF
+              if [ "${code}" = "404" ]; then
+                cat > /tmp/flow-v1.json <<EOF
               {
                 "snapshotMetadata": {
                   "bucketIdentifier": "${NIFI_REGISTRY_BUCKET_ID}",
@@ -284,11 +281,12 @@ spec:
               }
               EOF
 
-              code="$(check_http POST "${NIFI_REGISTRY_API}/buckets/${NIFI_REGISTRY_BUCKET_ID}/flows/${NIFI_REGISTRY_FLOW_ID}/versions" /tmp/flow-v1.json)"
-              if [ "${code}" != "200" ] && [ "${code}" != "201" ] && [ "${code}" != "409" ]; then
-                echo "Failed creating flow version 1: HTTP ${code}"
-                cat /tmp/resp.json || true
-                exit 1
+                code="$(check_http POST "${NIFI_REGISTRY_API}/buckets/${NIFI_REGISTRY_BUCKET_ID}/flows/${NIFI_REGISTRY_FLOW_ID}/versions" /tmp/flow-v1.json)"
+                if [ "${code}" != "200" ] && [ "${code}" != "201" ] && [ "${code}" != "409" ]; then
+                  echo "Failed creating flow version 1: HTTP ${code}"
+                  cat /tmp/resp.json || true
+                  exit 1
+                fi
               fi
 
               code="$(check_http GET "${NIFI_REGISTRY_API}/buckets/${NIFI_REGISTRY_BUCKET_ID}/flows/${NIFI_REGISTRY_FLOW_ID}/versions/1")"
@@ -297,6 +295,39 @@ spec:
                 cat /tmp/resp.json || true
                 exit 1
               fi
+
+              code="$(check_http GET "${NIFI_REGISTRY_API}/buckets/${NIFI_REGISTRY_BUCKET_ID}/flows/${NIFI_REGISTRY_FLOW_ID}/versions/2")"
+              if [ "${code}" = "200" ]; then
+                echo "Flow version 2 already exists; nothing to do."
+                exit 0
+              fi
+              if [ "${code}" != "404" ]; then
+                echo "Unexpected response checking flow version 2: HTTP ${code}"
+                cat /tmp/resp.json || true
+                exit 1
+              fi
+
+              code="$(check_http POST "${NIFI_REGISTRY_API}/buckets/${NIFI_REGISTRY_BUCKET_ID}/flows/${NIFI_REGISTRY_FLOW_ID}/versions" /snapshot/flow-v2.json)"
+              if [ "${code}" != "200" ] && [ "${code}" != "201" ] && [ "${code}" != "409" ]; then
+                echo "Failed creating flow version 2: HTTP ${code}"
+                cat /tmp/resp.json || true
+                exit 1
+              fi
+
+              code="$(check_http GET "${NIFI_REGISTRY_API}/buckets/${NIFI_REGISTRY_BUCKET_ID}/flows/${NIFI_REGISTRY_FLOW_ID}/versions/2")"
+              if [ "${code}" != "200" ]; then
+                echo "Flow version 2 was not found after bootstrap."
+                cat /tmp/resp.json || true
+                exit 1
+              fi
+          volumeMounts:
+            - name: flow-snapshot
+              mountPath: /snapshot
+              readOnly: true
+      volumes:
+        - name: flow-snapshot
+          configMap:
+            name: cms-translation-flow-snapshot
 ---
 apiVersion: nifi.konpyutaika.com/v1
 kind: NifiDataflow
@@ -310,11 +341,11 @@ spec:
   parentProcessGroupID: "root"
   bucketId: "<path:secret/data/k8s-kafka-nifi-registry-bucket-id#value>"
   flowId: "81895831-2aeb-45d8-ae08-16a60b74a4ad"
-  flowVersion: 1
+  flowVersion: 2
   flowPosition:
     posX: 400
     posY: 0
-  syncMode: never
+  syncMode: always
   updateStrategy: drain
   skipInvalidControllerService: true
   skipInvalidComponent: true

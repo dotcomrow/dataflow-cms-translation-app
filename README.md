@@ -20,7 +20,11 @@ The NiFi Registry flow ID is manifest-owned:
 
 - `81895831-2aeb-45d8-ae08-16a60b74a4ad`
 
-The `cms-translation-nifi-registry-bootstrap` Sync hook creates that Registry flow and version `1` if they do not already exist.
+The `cms-translation-nifi-registry-bootstrap` Sync hook creates that Registry
+flow, its empty bootstrap version `1`, and the verified production snapshot as
+version `2` when they do not already exist. The `NifiDataflow` pins version `2`
+with `syncMode: always`, so NiFiKop continuously restores the Git-managed flow
+instead of allowing uncommitted UI edits to drift from the repository.
 
 Required Vault values before first production sync:
 
